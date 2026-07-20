@@ -1227,6 +1227,15 @@ class WeixinAdapter(BasePlatformAdapter):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
 
+        # A Weixin DM has no topic/channel primitive that can permanently bind
+        # one skill. Keep configured intent bindings short-lived so a natural
+        # dinner conversation can carry its skill into terse follow-up messages
+        # without turning every Home DM into a dinner-only chat.
+        self._intent_skill_bindings = self._parse_intent_skill_bindings(
+            extra.get("intent_skill_bindings")
+        )
+        self._intent_skill_sessions: Dict[str, Tuple[List[str], float]] = {}
+
         if self._account_id and not self._token:
             persisted = load_weixin_account(hermes_home, self._account_id)
             if persisted:
@@ -1261,6 +1270,68 @@ class WeixinAdapter(BasePlatformAdapter):
         if isinstance(value, (list, tuple, set)):
             return [str(item).strip() for item in value if str(item).strip()]
         return [str(value).strip()] if str(value).strip() else []
+
+    def _parse_intent_skill_bindings(self, value: Any) -> List[Dict[str, Any]]:
+        """Normalize optional per-DM intent-to-skill bindings from config.extra."""
+        if not isinstance(value, list):
+            return []
+        bindings: List[Dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            chat_ids = self._coerce_list(item.get("ids") or item.get("id"))
+            skills = self._coerce_list(item.get("skills") or item.get("skill"))
+            triggers = self._coerce_list(item.get("triggers"))
+            if not chat_ids or not skills or not triggers:
+                continue
+            try:
+                followup_seconds = float(item.get("followup_seconds", 1200))
+            except (TypeError, ValueError):
+                followup_seconds = 1200.0
+            bindings.append(
+                {
+                    "ids": set(chat_ids),
+                    "skills": skills,
+                    "triggers": [trigger.casefold() for trigger in triggers],
+                    "followup_seconds": max(0.0, followup_seconds),
+                }
+            )
+        return bindings
+
+    def _resolve_intent_skills(
+        self, chat_id: str, text: str
+    ) -> Tuple[Optional[List[str]], bool]:
+        """Return configured skills and whether this turn must inject them.
+
+        The second return value is true only for the trigger turn. Follow-up
+        turns rely on the skill body already persisted in that conversation.
+        """
+        if not self._intent_skill_bindings:
+            return None, False
+
+        now = time.monotonic()
+        active = self._intent_skill_sessions.get(chat_id)
+        if active:
+            skills, expires_at = active
+            if now < expires_at:
+                return skills, False
+            self._intent_skill_sessions.pop(chat_id, None)
+
+        normalized = (text or "").casefold()
+        if not normalized:
+            return None, False
+        for binding in self._intent_skill_bindings:
+            if chat_id not in binding["ids"]:
+                continue
+            if not any(trigger in normalized for trigger in binding["triggers"]):
+                continue
+            skills = list(binding["skills"])
+            self._intent_skill_sessions[chat_id] = (
+                skills,
+                now + binding["followup_seconds"],
+            )
+            return skills, True
+        return None, False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not check_weixin_requirements():
@@ -1457,6 +1528,9 @@ class WeixinAdapter(BasePlatformAdapter):
             user_id=sender_id,
             user_name=sender_id,
         )
+        auto_skill, force_auto_skill = self._resolve_intent_skills(
+            effective_chat_id, text
+        )
         event = MessageEvent(
             text=text,
             message_type=_message_type_from_media(media_types, text),
@@ -1465,6 +1539,8 @@ class WeixinAdapter(BasePlatformAdapter):
             message_id=message_id or None,
             media_urls=media_paths,
             media_types=media_types,
+            auto_skill=auto_skill,
+            metadata={"force_auto_skill": force_auto_skill},
             timestamp=datetime.now(),
         )
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))

@@ -11377,11 +11377,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_entry.auto_reset_reason = None
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
-        # Discord channel_skill_bindings).  Supports a single name or ordered list.
-        # Only inject on NEW sessions — ongoing conversations already have the
-        # skill content in their conversation history from the first message.
+        # Discord channel_skill_bindings) and adapter-scoped intent bindings.
+        # A binding may explicitly request injection into an existing session
+        # when a new bounded topic starts in an otherwise general-purpose DM.
         _auto = getattr(event, "auto_skill", None)
-        if _is_new_session and _auto:
+        _force_auto_skill = bool(getattr(event, "metadata", {}).get("force_auto_skill"))
+        if (_is_new_session or _force_auto_skill) and _auto:
             _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
             try:
                 from agent.skill_commands import _load_skill_payload, _build_skill_message

@@ -239,6 +239,54 @@ class TestWeixinConfig:
         assert config.get_connected_platforms() == []
 
 
+class TestWeixinIntentSkillBindings:
+    def _adapter(self) -> WeixinAdapter:
+        return WeixinAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "account_id": "test-account",
+                    "intent_skill_bindings": [
+                        {
+                            "id": "home-dm",
+                            "skill": "family-dinner-planner",
+                            "triggers": ["晚餐", "菜单"],
+                            "followup_seconds": 1200,
+                        }
+                    ],
+                },
+            )
+        )
+
+    def test_trigger_turn_forces_skill_injection(self):
+        skills, should_inject = self._adapter()._resolve_intent_skills(
+            "home-dm", "帮我定今晚晚餐菜单"
+        )
+
+        assert skills == ["family-dinner-planner"]
+        assert should_inject is True
+
+    def test_followup_inherits_active_dinner_context_without_reinjection(self):
+        adapter = self._adapter()
+        adapter._resolve_intent_skills("home-dm", "今天晚餐吃什么")
+
+        skills, should_inject = adapter._resolve_intent_skills(
+            "home-dm", "杏鲍菇牛肉粒，家常茄子，再来拍黄瓜"
+        )
+
+        assert skills == ["family-dinner-planner"]
+        assert should_inject is False
+
+    def test_binding_does_not_affect_other_chats(self):
+        skills, should_inject = self._adapter()._resolve_intent_skills(
+            "other-dm", "今晚晚餐菜单"
+        )
+
+        assert skills is None
+        assert should_inject is False
+
+
 class TestWeixinStatePersistence:
     def test_save_weixin_account_preserves_existing_file_on_replace_failure(self, tmp_path, monkeypatch):
         account_path = tmp_path / "weixin" / "accounts" / "acct.json"
